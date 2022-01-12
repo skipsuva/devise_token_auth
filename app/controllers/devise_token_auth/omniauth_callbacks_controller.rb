@@ -1,7 +1,11 @@
+# frozen_string_literal: true
+
 module DeviseTokenAuth
   class OmniauthCallbacksController < DeviseTokenAuth::ApplicationController
-
     attr_reader :auth_params
+
+    before_action :validate_auth_origin_url_param
+
     skip_before_action :set_user_by_token, raise: false
     skip_after_action :update_auth_header
 
@@ -11,11 +15,8 @@ module DeviseTokenAuth
 
       # derive target redirect route from 'resource_class' param, which was set
       # before authentication.
-      devise_mapping = [request.env['omniauth.params']['namespace_name'],
-                        request.env['omniauth.params']['resource_class'].underscore.gsub('/', '_')].compact.join('_')
-      path = "#{Devise.mappings[devise_mapping.to_sym].fullpath}/#{params[:provider]}/callback"
-      klass = request.scheme == 'https' ? URI::HTTPS : URI::HTTP
-      redirect_route = klass.build(host: request.host, port: request.port, path: path).to_s
+      devise_mapping = get_devise_mapping
+      redirect_route = get_redirect_route(devise_mapping)
 
       # preserve omniauth info for success route. ignore 'extra' in twitter
       # auth response to avoid CookieOverflow.
@@ -25,13 +26,40 @@ module DeviseTokenAuth
       redirect_to redirect_route
     end
 
+    def get_redirect_route(devise_mapping)
+      path = "#{Devise.mappings[devise_mapping.to_sym].fullpath}/#{params[:provider]}/callback"
+      klass = request.scheme == 'https' ? URI::HTTPS : URI::HTTP
+      redirect_route = klass.build(host: request.host, port: request.port, path: path).to_s
+    end
+
+    def get_devise_mapping
+       # derive target redirect route from 'resource_class' param, which was set
+       # before authentication.
+       devise_mapping = [request.env['omniauth.params']['namespace_name'],
+                         request.env['omniauth.params']['resource_class'].underscore.gsub('/', '_')].compact.join('_')
+    rescue NoMethodError => err
+      default_devise_mapping
+    end
+
+    # This method will only be called if `get_devise_mapping` cannot
+    # find the mapping in `omniauth.params`.
+    #
+    # One example use-case here is for IDP-initiated SAML login.  In that
+    # case, there will have been no initial request in which to save 
+    # the devise mapping.  If you are in a situation like that, and
+    # your app allows for you to determine somehow what the devise
+    # mapping should be (because, for example, it is always the same),
+    # then you can handle it by overriding this method.
+    def default_devise_mapping
+      raise NotImplementedError.new('no default_devise_mapping set')
+    end
+
     def omniauth_success
       get_resource_from_auth_hash
-      create_token_info
       set_token_on_resource
       create_auth_params
 
-      if resource_class.devise_modules.include?(:confirmable)
+      if confirmable_enabled?
         # don't send confirmation email!!!
         @resource.skip_confirmation!
       end
@@ -47,8 +75,13 @@ module DeviseTokenAuth
 
     def omniauth_failure
       @error = params[:message]
-      render_data_or_redirect('authFailure', {error: @error})
+      render_data_or_redirect('authFailure', error: @error)
     end
+
+    def validate_auth_origin_url_param 
+      return render_error_not_allowed_auth_origin_url if auth_origin_url && blacklisted_redirect_url?(auth_origin_url)
+    end
+  
 
     protected
 
@@ -61,7 +94,7 @@ module DeviseTokenAuth
     # after use.  In the failure case, finally, the omniauth params
     # are added as query params in our monkey patch to OmniAuth in engine.rb
     def omniauth_params
-      if !defined?(@_omniauth_params)
+      unless defined?(@_omniauth_params)
         if request.env['omniauth.params'] && request.env['omniauth.params'].any?
           @_omniauth_params = request.env['omniauth.params']
         elsif session['dta.omniauth.params'] && session['dta.omniauth.params'].any?
@@ -79,25 +112,20 @@ module DeviseTokenAuth
 
     # break out provider attribute assignment for easy method extension
     def assign_provider_attrs(user, auth_hash)
-      user.assign_attributes({
-        nickname: auth_hash['info']['nickname'],
-        name:     auth_hash['info']['name'],
-        image:    auth_hash['info']['image'],
-        email:    auth_hash['info']['email']
-      })
+      attrs = auth_hash['info'].to_hash
+      attrs = attrs.slice(*user.attribute_names)
+      user.assign_attributes(attrs)
     end
 
     # derive allowed params from the standard devise parameter sanitizer
     def whitelisted_params
       whitelist = params_for_resource(:sign_up)
 
-      whitelist.inject({}){|coll, key|
+      whitelist.inject({}) do |coll, key|
         param = omniauth_params[key.to_s]
-        if param
-          coll[key] = param
-        end
+        coll[key] = param if param
         coll
-      }
+      end
     end
 
     def resource_class(mapping = nil)
@@ -106,7 +134,7 @@ module DeviseTokenAuth
       elsif params['resource_class']
         params['resource_class'].constantize
       else
-        raise "No resource_class found"
+        raise 'No resource_class found'
       end
     end
 
@@ -118,8 +146,16 @@ module DeviseTokenAuth
       omniauth_params['omniauth_window_type']
     end
 
-    def auth_origin_url
+    def unsafe_auth_origin_url
       omniauth_params['auth_origin_url'] || omniauth_params['origin']
+    end
+
+
+    def auth_origin_url
+      if unsafe_auth_origin_url && blacklisted_redirect_url?(unsafe_auth_origin_url)
+        return nil
+      end
+      return unsafe_auth_origin_url
     end
 
     # in the success case, omniauth_window_type is in the omniauth_params.
@@ -142,56 +178,39 @@ module DeviseTokenAuth
       true
     end
 
-    # necessary for access to devise_parameter_sanitizers
-    def devise_mapping
-      if omniauth_params
-        Devise.mappings[[omniauth_params['namespace_name'],
-                         omniauth_params['resource_class'].underscore].compact.join('_').to_sym]
-      else
-        request.env['devise.mapping']
-      end
-    end
-
     def set_random_password
       # set crazy password for new oauth users. this is only used to prevent
-        # access via email sign-in.
-        p = SecureRandom.urlsafe_base64(nil, false)
-        @resource.password = p
-        @resource.password_confirmation = p
-    end
-
-    def create_token_info
-      # create token info
-      @client_id = SecureRandom.urlsafe_base64(nil, false)
-      @token     = SecureRandom.urlsafe_base64(nil, false)
-      @expiry    = (Time.now + DeviseTokenAuth.token_lifespan).to_i
-      @config    = omniauth_params['config_name']
+      # access via email sign-in.
+      p = SecureRandom.urlsafe_base64(nil, false)
+      @resource.password = p
+      @resource.password_confirmation = p
     end
 
     def create_auth_params
       @auth_params = {
-        auth_token:     @token,
-        client_id: @client_id,
-        uid:       @resource.uid,
-        expiry:    @expiry,
-        config:    @config
+        auth_token: @token.token,
+        client_id:  @token.client,
+        uid:        @resource.uid,
+        expiry:     @token.expiry,
+        config:     @config
       }
       @auth_params.merge!(oauth_registration: true) if @oauth_registration
       @auth_params
     end
 
     def set_token_on_resource
-      @resource.tokens[@client_id] = {
-        token: BCrypt::Password.create(@token),
-        expiry: @expiry
-      }
+      @config = omniauth_params['config_name']
+      @token  = @resource.create_token
+    end
+
+    def render_error_not_allowed_auth_origin_url
+      message = I18n.t('devise_token_auth.omniauth.not_allowed_redirect_url', redirect_url: unsafe_auth_origin_url)
+      render_data_or_redirect('authFailure', error: message)
     end
 
     def render_data(message, data)
-      @data = data.merge({
-        message: message
-      })
-      render :layout => nil, :template => "devise_token_auth/omniauth_external_window"
+      @data = data.merge(message: ActionController::Base.helpers.sanitize(message))
+      render layout: nil, template: 'devise_token_auth/omniauth_external_window'
     end
 
     def render_data_or_redirect(message, data, user_data = {})
@@ -222,37 +241,47 @@ module DeviseTokenAuth
     end
 
     def fallback_render(text)
-        render inline: %Q|
+        render inline: %Q(
 
             <html>
                     <head></head>
                     <body>
-                            #{text}
+                            #{ActionController::Base.helpers.sanitize(text)}
                     </body>
-            </html>|
+            </html>)
+    end
+
+    def handle_new_resource
+      @oauth_registration = true
+      set_random_password
+    end
+
+    def assign_whitelisted_params?
+      true
     end
 
     def get_resource_from_auth_hash
       # find or create user by provider and provider uid
-      @resource = resource_class.where({
-        uid:      auth_hash['uid'],
+      @resource = resource_class.where(
+        uid: auth_hash['uid'],
         provider: auth_hash['provider']
-      }).first_or_initialize
+      ).first_or_initialize
 
       if @resource.new_record?
-        @oauth_registration = true
-        set_random_password
+        handle_new_resource
       end
 
       # sync user info with provider, update/generate auth token
       assign_provider_attrs(@resource, auth_hash)
 
       # assign any additional (whitelisted) attributes
-      extra_params = whitelisted_params
-      @resource.assign_attributes(extra_params) if extra_params
+      if assign_whitelisted_params?
+        extra_params = whitelisted_params
+        @resource.assign_attributes(extra_params) if extra_params
+      end
 
       @resource
     end
-
   end
+
 end
